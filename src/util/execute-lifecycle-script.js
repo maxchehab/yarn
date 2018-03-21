@@ -8,7 +8,7 @@ import * as child from './child.js';
 import {exists} from './fs.js';
 import {registries} from '../resolvers/index.js';
 import {fixCmdWinSlashes} from './fix-cmd-win-slashes.js';
-import {run as globalRun, getBinFolder as getGlobalBinFolder} from '../cli/commands/global.js';
+import {getBinFolder as getGlobalBinFolder, run as globalRun} from '../cli/commands/global.js';
 
 const invariant = require('invariant');
 const path = require('path');
@@ -25,6 +25,8 @@ const IGNORE_MANIFEST_KEYS = ['readme'];
 // This helps us avoid some gyp issues when building native modules.
 // See https://github.com/yarnpkg/yarn/issues/2286.
 const IGNORE_CONFIG_KEYS = ['lastUpdateCheck'];
+
+const INVALID_CHAR_REGEX = /[^a-zA-Z0-9_]/g;
 
 export async function makeEnv(
   stage: string,
@@ -91,40 +93,52 @@ export async function makeEnv(
         }
 
         //replacing invalid chars with underscore
-        const cleanKey = key.replace(/[^a-zA-Z0-9_]/g, '_');
+        const cleanKey = key.replace(INVALID_CHAR_REGEX, '_');
 
         env[`npm_package_${cleanKey}`] = cleanVal;
       }
     }
   }
 
-  // add npm_config_*
+  // add npm_config_* and npm_package_config_* from yarn config
   const keys: Set<string> = new Set([
     ...Object.keys(config.registries.yarn.config),
     ...Object.keys(config.registries.npm.config),
   ]);
-  for (const key of keys) {
-    if (key.match(/:_/) || IGNORE_CONFIG_KEYS.indexOf(key) >= 0) {
-      continue;
-    }
+  const cleaned = Array.from(keys)
+    .filter(key => !key.match(/:_/) && IGNORE_CONFIG_KEYS.indexOf(key) === -1)
+    .map(key => {
+      let val = config.getOption(key);
+      if (!val) {
+        val = '';
+      } else if (typeof val === 'number') {
+        val = '' + val;
+      } else if (typeof val !== 'string') {
+        val = JSON.stringify(val);
+      }
 
-    let val = config.getOption(key);
-
-    if (!val) {
-      val = '';
-    } else if (typeof val === 'number') {
-      val = '' + val;
-    } else if (typeof val !== 'string') {
-      val = JSON.stringify(val);
-    }
-
-    if (val.indexOf('\n') >= 0) {
-      val = JSON.stringify(val);
-    }
-
+      if (val.indexOf('\n') >= 0) {
+        val = JSON.stringify(val);
+      }
+      return [key, val];
+    });
+  // add npm_config_*
+  for (const [key, val] of cleaned) {
     const cleanKey = key.replace(/^_+/, '');
-    const envKey = `npm_config_${cleanKey}`.replace(/[^a-zA-Z0-9_]/g, '_');
+    const envKey = `npm_config_${cleanKey}`.replace(INVALID_CHAR_REGEX, '_');
     env[envKey] = val;
+  }
+  // add npm_package_config_*
+  if (manifest && manifest.name) {
+    const packageConfigPrefix = `${manifest.name}:`;
+    for (const [key, val] of cleaned) {
+      if (key.indexOf(packageConfigPrefix) !== 0) {
+        continue;
+      }
+      const cleanKey = key.replace(/^_+/, '').replace(packageConfigPrefix, '');
+      const envKey = `npm_package_config_${cleanKey}`.replace(INVALID_CHAR_REGEX, '_');
+      env[envKey] = val;
+    }
   }
 
   // split up the path
@@ -136,6 +150,10 @@ export async function makeEnv(
   pathParts.unshift(path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'node-gyp-bin'));
   pathParts.unshift(
     path.join(path.dirname(process.execPath), '..', 'lib', 'node_modules', 'npm', 'bin', 'node-gyp-bin'),
+  );
+  // Include node-gyp version from homebrew managed npm, if available.
+  pathParts.unshift(
+    path.join(path.dirname(process.execPath), '..', 'libexec', 'lib', 'node_modules', 'npm', 'bin', 'node-gyp-bin'),
   );
 
   // Add global bin folder if it is not present already, as some packages depend
@@ -171,6 +189,7 @@ export async function executeLifecycleScript(
   cwd: string,
   cmd: string,
   spinner?: ReporterSpinner,
+  customShell?: string,
 ): LifecycleReturn {
   // if we don't have a spinner then pipe everything to the terminal
   const stdio = spinner ? undefined : 'inherit';
@@ -179,8 +198,7 @@ export async function executeLifecycleScript(
 
   await checkForGypIfNeeded(config, cmd, env[constants.ENV_PATH_KEY].split(path.delimiter));
 
-  // get shell
-  if (process.platform === 'win32') {
+  if (process.platform === 'win32' && (!customShell || customShell === 'cmd')) {
     // handle windows run scripts starting with a relative path
     cmd = fixCmdWinSlashes(cmd);
   }
@@ -204,7 +222,9 @@ export async function executeLifecycleScript(
       }
     };
   }
-  const stdout = await child.spawn(cmd, [], {shell: true, cwd, env, stdio}, updateProgress);
+  const stdout = customShell
+    ? await child.spawn(customShell, [cmd], {cwd, env, stdio, windowsVerbatimArguments: true}, updateProgress)
+    : await child.spawn(cmd, [], {cwd, env, stdio, shell: true}, updateProgress);
 
   return {cwd, command: cmd, stdout};
 }
@@ -260,11 +280,17 @@ export async function execFromManifest(config: Config, commandName: string, cwd:
   }
 }
 
-export async function execCommand(stage: string, config: Config, cmd: string, cwd: string): Promise<void> {
+export async function execCommand(
+  stage: string,
+  config: Config,
+  cmd: string,
+  cwd: string,
+  customShell?: string,
+): Promise<void> {
   const {reporter} = config;
   try {
     reporter.command(cmd);
-    await executeLifecycleScript(stage, config, cwd, cmd);
+    await executeLifecycleScript(stage, config, cwd, cmd, undefined, customShell);
     return Promise.resolve();
   } catch (err) {
     if (err instanceof ProcessTermError) {
